@@ -1,8 +1,8 @@
 import streamlit as st
-import chromadb
 import anthropic
 import os
 import re
+import numpy as np
 from sentence_transformers import SentenceTransformer
 from pathlib import Path
 
@@ -14,9 +14,32 @@ st.set_page_config(
 )
 
 # --- Configuration ---
-COLLECTION_NAME = "insurance_kb"
 KB_PATH = "knowledge_base"
 TOP_K = 3
+
+
+# --- Simple vector store (numpy-based, no external DB needed) ---
+class SimpleVectorStore:
+    def __init__(self):
+        self.documents = []
+        self.metadatas = []
+        self.embeddings = None
+
+    def add(self, documents, embeddings, metadatas):
+        self.documents = documents
+        self.metadatas = metadatas
+        self.embeddings = np.array(embeddings)
+
+    def query(self, query_embedding, n_results=3):
+        query_vec = np.array(query_embedding)
+        # Cosine similarity
+        norms = np.linalg.norm(self.embeddings, axis=1) * np.linalg.norm(query_vec)
+        similarities = np.dot(self.embeddings, query_vec) / (norms + 1e-10)
+        top_indices = np.argsort(similarities)[::-1][:n_results]
+        return {
+            "documents": [[self.documents[i] for i in top_indices]],
+            "metadatas": [[self.metadatas[i] for i in top_indices]]
+        }
 
 
 # --- Helper functions ---
@@ -75,10 +98,7 @@ def initialize_rag():
     """Load embedding model and build vector store from KB articles.
     Cached per session — runs once, shared across all users."""
     model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-
-    # In-memory ChromaDB — rebuilt each session from source articles
-    client = chromadb.Client()
-    collection = client.get_or_create_collection(name=COLLECTION_NAME)
+    store = SimpleVectorStore()
 
     kb_path = Path(KB_PATH)
     all_chunks = []
@@ -90,32 +110,20 @@ def initialize_rag():
     if all_chunks:
         texts = [c["text"] for c in all_chunks]
         metadatas = [c["metadata"] for c in all_chunks]
-        ids = [f"chunk_{i}" for i in range(len(all_chunks))]
         embeddings = model.encode(texts, show_progress_bar=False).tolist()
-        collection.add(
-            documents=texts,
-            embeddings=embeddings,
-            metadatas=metadatas,
-            ids=ids
-        )
+        store.add(documents=texts, embeddings=embeddings, metadatas=metadatas)
 
-    return model, collection
+    return model, store
 
 
-def retrieve(query, model, collection, top_k=TOP_K):
+def retrieve(query, model, store, top_k=TOP_K):
     """Convert query to embedding and find most similar chunks."""
     query_embedding = model.encode(query).tolist()
-    results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=top_k,
-        include=["documents", "metadatas"]
-    )
-    return results
+    return store.query(query_embedding, n_results=top_k)
 
 
-def generate_response(query, chunks, metadatas):
+def generate_response(query, chunks):
     """Pass retrieved chunks and query to Claude and return response."""
-    # Works with Streamlit secrets (cloud) or environment variable (local)
     api_key = st.secrets.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY"))
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -148,11 +156,11 @@ st.caption(
 
 st.divider()
 
-# Load RAG system with visible spinner
+# Load RAG system
 with st.spinner("Loading knowledge base and embedding model..."):
-    model, collection = initialize_rag()
+    model, store = initialize_rag()
 
-# Initialize chat history in session state
+# Initialize chat history
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -168,18 +176,16 @@ for message in st.session_state.messages:
 # Chat input
 if prompt := st.chat_input("Ask a life insurance question..."):
 
-    # Display user message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
 
-    # Retrieve and generate
     with st.chat_message("assistant"):
         with st.spinner("Searching knowledge base..."):
-            results = retrieve(prompt, model, collection)
+            results = retrieve(prompt, model, store)
             chunks = results["documents"][0]
             metadatas = results["metadatas"][0]
-            response = generate_response(prompt, chunks, metadatas)
+            response = generate_response(prompt, chunks)
 
         st.write(response)
 
@@ -187,7 +193,6 @@ if prompt := st.chat_input("Ask a life insurance question..."):
             for meta in metadatas:
                 st.caption(f"📄 {meta['article']} — {meta['section']}")
 
-    # Save to session history
     st.session_state.messages.append({
         "role": "assistant",
         "content": response,
